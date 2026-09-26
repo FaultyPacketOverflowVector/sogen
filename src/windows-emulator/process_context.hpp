@@ -418,6 +418,9 @@ namespace sogen
 
         void serialize(utils::buffer_serializer& buffer, const emulator_thread* active_thread) const;
         void deserialize(utils::buffer_deserializer& buffer, emulator_thread*& active_thread);
+        void prepare_for_state_restore(windows_emulator& win_emu);
+        void restore_after_state_restore(windows_emulator& win_emu);
+        void restore_windows_after_state_restore(windows_emulator& win_emu);
 
         generic_handle_store* get_handle_store(handle handle);
         emulator_thread* find_thread_by_id(uint32_t thread_id);
@@ -528,7 +531,7 @@ namespace sogen
         handle_store<handle_types::event, event> events{};
         handle_store<handle_types::file, file> files{};
         utils::insensitive_u16string_map<file_lock_ranges> file_locks{};
-        handle_store<handle_types::section, section, 2> sections{};
+        handle_store<handle_types::section, section> sections{};
         handle_store<handle_types::device, io_device_container> devices{};
         handle console_handle{};
         handle_store<handle_types::semaphore, semaphore> semaphores{};
@@ -544,7 +547,7 @@ namespace sogen
         user_handle_store<handle_types::type::menu, menu> menus{user_handles};
         handle_store<handle_types::timer, timer> timers{};
         user_handle_store<handle_types::accelerator_table, accelerator_table> accelerator_tables{user_handles};
-        handle_store<handle_types::registry, registry_key, 2> registry_keys{};
+        handle_store<handle_types::registry, registry_key> registry_keys{};
         std::map<uint32_t, handle> thread_handles_by_id{};
         std::map<uint16_t, atom_entry> atoms{};
         utils::insensitive_u16string_map<class_entry> classes{};
@@ -571,7 +574,7 @@ namespace sogen
         // The audio render thread signals it at the device rate so the client's render loop wakes and refills the
         // shared buffer. Stored as a handle rather than a pointer: the render thread is host-owned, so it resolves
         // this through windows_emulator::try_signal_guest_event under the kernel lock instead of racing a close on
-        // an emulator thread. Transient runtime state, not serialized (re-established on the next SetEventHandle).
+        // an emulator thread.
         std::atomic<uint64_t> audio_render_event{};
 
         // Extended parameters from last NtMapViewOfSectionEx call

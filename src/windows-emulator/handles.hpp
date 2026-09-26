@@ -46,7 +46,10 @@ namespace sogen
 
     struct handle_value
     {
-        uint64_t id : 23;
+        // NT handles are multiples of 4: the kernel ignores the low 2 bits and user mode tags them
+        // (rpcrt4 keeps private flags there), so an id starting at bit 0 would alias a neighbouring handle.
+        uint64_t reserved : 2;
+        uint64_t id : 21;
         uint64_t type : 7;
         uint64_t is_system : 1;
         uint64_t is_pseudo : 1;
@@ -181,13 +184,14 @@ namespace sogen
         virtual std::optional<handle> duplicate(handle h) = 0;
     };
 
-    template <handle_types::type Type, typename T, uint32_t IndexShift = 0>
+    template <handle_types::type Type, typename T>
         requires(utils::Serializable<T> && std::is_base_of_v<ref_counted_object, T>)
     class handle_store : public generic_handle_store
     {
       public:
         using index_type = uint32_t;
         using value_map = std::map<index_type, T>;
+        using iterator = typename value_map::iterator;
 
         bool block_mutation(bool blocked)
         {
@@ -219,7 +223,7 @@ namespace sogen
             h.bits = 0;
             h.value.is_pseudo = false;
             h.value.type = Type;
-            h.value.id = index << IndexShift;
+            h.value.id = index;
 
             return h;
         }
@@ -270,7 +274,7 @@ namespace sogen
             return h;
         }
 
-        std::pair<typename value_map::iterator, bool> erase(const value_map::iterator& entry)
+        std::pair<iterator, bool> erase(const iterator& entry)
         {
             if (this->block_mutation_)
             {
@@ -390,7 +394,7 @@ namespace sogen
             return this->store_.begin();
         }
 
-        value_map::iterator end()
+        iterator end()
         {
             return this->store_.end();
         }
@@ -408,7 +412,7 @@ namespace sogen
                 return this->store_.end();
             }
 
-            return this->store_.find(static_cast<uint32_t>(h.id) >> IndexShift);
+            return this->store_.find(static_cast<uint32_t>(h.id));
         }
 
         uint32_t find_free_index()

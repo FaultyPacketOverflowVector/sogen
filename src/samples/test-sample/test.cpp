@@ -28,6 +28,7 @@
 #include <combaseapi.h>
 #include <knownfolders.h>
 #include <sddl.h>
+#include <bcrypt.h>
 
 using namespace std::literals;
 
@@ -1181,6 +1182,90 @@ namespace
         return executions == 2;
     }
 
+    bool test_window_geometry()
+    {
+        WNDCLASSEXA wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestWindowNonclientClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = DefWindowProcA;
+
+        if (!RegisterClassExA(&wc))
+        {
+            puts("Failed to register window class");
+            return false;
+        }
+
+        const auto unregister_class = sogen::utils::finally([&] { UnregisterClassA(wc.lpszClassName, wc.hInstance); });
+
+        struct window_case
+        {
+            DWORD style;
+            DWORD ex_style;
+        };
+
+        constexpr std::array cases = {
+            window_case{.style = WS_POPUP | WS_THICKFRAME, .ex_style = 0},
+            window_case{.style = WS_POPUP | WS_CAPTION, .ex_style = 0},
+            window_case{.style = WS_POPUP | WS_DLGFRAME, .ex_style = 0},
+            window_case{.style = WS_POPUP, .ex_style = WS_EX_CLIENTEDGE},
+        };
+
+        for (const auto& test : cases)
+        {
+            constexpr LONG expected_client_height = 123;
+            constexpr LONG expected_client_width = 321;
+
+            RECT adjusted_rect{0, 0, expected_client_width, expected_client_height};
+            const BOOL adjusted = test.ex_style ? AdjustWindowRectEx(&adjusted_rect, test.style, FALSE, test.ex_style)
+                                                : AdjustWindowRect(&adjusted_rect, test.style, FALSE);
+            if (!adjusted)
+            {
+                puts("Failed to calculate nonclient insets");
+                return false;
+            }
+
+            const auto adjusted_width = adjusted_rect.right - adjusted_rect.left;
+            const auto adjusted_height = adjusted_rect.bottom - adjusted_rect.top;
+
+            const HWND hwnd = CreateWindowExA(test.ex_style, wc.lpszClassName, nullptr, test.style, 0, 0, adjusted_width, adjusted_height,
+                                              nullptr, nullptr, wc.hInstance, nullptr);
+            if (!hwnd)
+            {
+                puts("Failed to create test window");
+                return false;
+            }
+
+            const auto destroy_window = sogen::utils::finally([&] { DestroyWindow(hwnd); });
+
+            RECT window_rect{};
+            RECT client_rect{};
+            if (!GetWindowRect(hwnd, &window_rect) || !GetClientRect(hwnd, &client_rect))
+            {
+                return false;
+            }
+
+            const auto window_width = window_rect.right - window_rect.left;
+            const auto window_height = window_rect.bottom - window_rect.top;
+            const auto client_width = client_rect.right - client_rect.left;
+            const auto client_height = client_rect.bottom - client_rect.top;
+
+            if (window_width != adjusted_width || window_height != adjusted_height)
+            {
+                puts("Window size does not match AdjustWindowRect result");
+                return false;
+            }
+
+            if (client_width != expected_client_width || client_height != expected_client_height)
+            {
+                puts("AdjustWindowRect round-trip failed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool test_message_queue()
     {
         thread_local UINT wnd_proc_num = 0;
@@ -1774,6 +1859,58 @@ namespace
         return true;
     }
 
+    bool test_handle_tag_bits()
+    {
+        using nt_close_t = LONG(NTAPI*)(HANDLE);
+        const auto nt_close =
+            reinterpret_cast<nt_close_t>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtClose")));
+        if (!nt_close)
+        {
+            puts("ntdll!NtClose not found");
+            return false;
+        }
+
+        const auto open_file = [](const char* path) {
+            return CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        };
+
+        const auto is_open = [](const HANDLE file) {
+            char byte{};
+            DWORD read{};
+            return ReadFile(file, &byte, sizeof(byte), &read, nullptr) != FALSE;
+        };
+
+        bool valid = true;
+
+        for (uint32_t tag = 0; tag < 4; ++tag)
+        {
+            const HANDLE before = open_file(R"(C:\Windows\System32\ntdll.dll)");
+            const HANDLE target = open_file(R"(C:\Windows\System32\kernel32.dll)");
+            const HANDLE after = open_file(R"(C:\Windows\System32\kernelbase.dll)");
+
+            if (before == INVALID_HANDLE_VALUE || target == INVALID_HANDLE_VALUE || after == INVALID_HANDLE_VALUE)
+            {
+                puts("Failed to open the probe files");
+                return false;
+            }
+
+            auto* const tagged = reinterpret_cast<HANDLE>((reinterpret_cast<ULONG_PTR>(target) & ~ULONG_PTR{3}) | tag);
+            const auto status = nt_close(tagged);
+
+            if (status != 0 || !is_open(before) || is_open(target) || !is_open(after))
+            {
+                printf("NtClose(%p) with tag %u did not close exactly %p (status 0x%08lX)\n", tagged, tag, target, status);
+                valid = false;
+                CloseHandle(target);
+            }
+
+            CloseHandle(before);
+            CloseHandle(after);
+        }
+
+        return valid;
+    }
+
     bool test_gdi()
     {
         const wchar_t* cursor_path = L"C:\\Windows\\Cursors\\aero_arrow.cur";
@@ -1801,6 +1938,49 @@ namespace
         DestroyCursor(cursor);
         return true;
     }
+
+    bool test_bcrypt_hash()
+    {
+        struct hash_vector
+        {
+            const wchar_t* algorithm;
+            std::vector<UCHAR> digest;
+        };
+
+        const std::array<hash_vector, 2> vectors{{
+            {.algorithm = BCRYPT_MD5_ALGORITHM,
+             .digest = {0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72}},
+            {.algorithm = BCRYPT_SHA256_ALGORITHM,
+             .digest = {0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+                        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad}},
+        }};
+
+        std::array<UCHAR, 3> input{'a', 'b', 'c'};
+
+        for (const auto& vector : vectors)
+        {
+            BCRYPT_ALG_HANDLE algorithm{};
+            const auto open_status = BCryptOpenAlgorithmProvider(&algorithm, vector.algorithm, nullptr, 0);
+            if (!BCRYPT_SUCCESS(open_status))
+            {
+                printf("BCryptOpenAlgorithmProvider(%ls) failed: 0x%08lX\n", vector.algorithm, open_status);
+                return false;
+            }
+
+            const auto close_algorithm = sogen::utils::finally([&] { BCryptCloseAlgorithmProvider(algorithm, 0); });
+
+            std::vector<UCHAR> digest(vector.digest.size());
+            const auto hash_status = BCryptHash(algorithm, nullptr, 0, input.data(), static_cast<ULONG>(input.size()), digest.data(),
+                                                static_cast<ULONG>(digest.size()));
+            if (!BCRYPT_SUCCESS(hash_status) || digest != vector.digest)
+            {
+                printf("BCryptHash(%ls) failed: 0x%08lX\n", vector.algorithm, hash_status);
+                return false;
+            }
+        }
+
+        return true;
+    }
 }
 
 #define RUN_TEST(func, name)                 \
@@ -1817,6 +1997,13 @@ int main(const int argc, const char* argv[])
     {
         print_time();
         return 0;
+    }
+
+    if (argc == 2 && argv[1] == "-fail-fast"sv)
+    {
+        EXCEPTION_RECORD record{};
+        record.ExceptionCode = 0xE0001234;
+        RaiseFailFastException(&record, nullptr, 0);
     }
 
     bool valid = true;
@@ -1850,15 +2037,18 @@ int main(const int argc, const char* argv[])
     RUN_TEST(test_tls, "TLS")
     RUN_TEST(test_socket, "Socket")
     RUN_TEST(test_apc, "APC")
+    RUN_TEST(test_window_geometry, "Window Geometry")
     RUN_TEST(test_user_callback, "User Callback")
     RUN_TEST(test_mutable_callbacks, "Mutable User Callback")
     RUN_TEST(test_message_queue, "Message Queue (General)")
     RUN_TEST(test_paint_message_queue, "Message Queue (Paint)")
     RUN_TEST(test_settimer, "User Timer")
     RUN_TEST(test_private_namespace, "Private Namespace")
+    RUN_TEST(test_handle_tag_bits, "Handle Tag Bits")
     RUN_TEST(test_actctx, "Activation Context")
     RUN_TEST(test_mmio, "MMIO")
     RUN_TEST(test_gdi, "GDI")
+    RUN_TEST(test_bcrypt_hash, "BCrypt Hash")
 
     return valid ? 0 : 1;
 }

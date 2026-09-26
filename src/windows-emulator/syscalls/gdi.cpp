@@ -1,5 +1,6 @@
 #include "../std_include.hpp"
 #include "../debug_font.hpp"
+#include "../emulated_display_adapter.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
 
@@ -198,6 +199,8 @@ namespace sogen
             constexpr uint32_t k_dxgk_context_handle = 0x6000;
             constexpr uint32_t k_dxgk_shared_primary_handle = 0x7000;
             constexpr LUID k_dxgk_adapter_luid = {0x1000, 0};
+            // Stable emulator-only unique adapter id. Sequential, not a host device.
+            constexpr GUID k_dxgk_adapter_unique_id = {0x00000001, 0x0002, 0x0003, {0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
             constexpr uint32_t k_dxgk_adapter_source_count = 1;
             constexpr uint32_t k_dxgk_command_buffer_size = 0x1000;
             constexpr uint32_t k_dxgk_allocation_list_entry_size = 8;
@@ -212,15 +215,11 @@ namespace sogen
             constexpr uint32_t k_dxgk_max_list_count = 0x10000;            // 64k entries (<= 1.5 MiB of list bytes)
             constexpr uint64_t k_dxgk_dedicated_video_memory_size = 4ull * 1024 * 1024 * 1024;
             constexpr uint64_t k_dxgk_shared_system_memory_size = 8ull * 1024 * 1024 * 1024;
-            constexpr uint32_t k_dxgk_fake_vendor_id = 0x10DE;
-            constexpr uint32_t k_dxgk_fake_device_id = 0x1C03;
-            constexpr uint32_t k_dxgk_fake_revision_id = 0xA1;
             constexpr uint32_t k_dxgk_open_resource_resource_private_size = 0x18;
             constexpr uint32_t k_dxgk_open_resource_allocation_private_size = 0x18;
             constexpr uint32_t k_dxgk_open_resource_descriptor_size = 0x80;
             constexpr uint32_t k_dxgk_open_resource_total_private_size =
                 k_dxgk_open_resource_allocation_private_size + k_dxgk_open_resource_descriptor_size;
-            constexpr GUID k_dxgk_adapter_guid = {0x5b45201d, 0xf2f2, 0x4f3b, {0x85, 0xbb, 0x30, 0xff, 0x1f, 0x95, 0x35, 0x99}};
 
             uint64_t ensure_gdi_shared_table(const syscall_context& c)
             {
@@ -575,14 +574,14 @@ namespace sogen
                     win = win->parent_handle != 0 ? c.proc.windows.get(win->parent_handle) : nullptr;
                 }
 
-                if (!win || !win->host_surface_window || win->width <= 0 || win->height <= 0)
+                if (!win || !win->host_surface_window || win->client_width() <= 0 || win->client_height() <= 0)
                 {
                     return nullptr;
                 }
 
                 const auto top_handle = static_cast<uint32_t>(win->handle);
-                const auto width = static_cast<uint32_t>(win->width);
-                const auto height = static_cast<uint32_t>(win->height);
+                const auto width = static_cast<uint32_t>(win->client_width());
+                const auto height = static_cast<uint32_t>(win->client_height());
 
                 auto& surface = c.proc.gdi_window_surfaces[top_handle];
                 if (surface.width != width || surface.height != height || surface.pixels.size() != static_cast<size_t>(width) * height)
@@ -4129,7 +4128,7 @@ namespace sogen
             }
 
             case KMTQAITYPE::KMTQAITYPE_ADAPTERGUID: {
-                GUID adapter_guid = k_dxgk_adapter_guid;
+                GUID adapter_guid = k_dxgk_adapter_unique_id;
                 return write_query_adapter_info(c, query, adapter_guid);
             }
 
@@ -4201,10 +4200,10 @@ namespace sogen
                     UINT32 FunctionNumber;
                 } ids{};
 
-                ids.VendorID = k_dxgk_fake_vendor_id;
-                ids.DeviceID = k_dxgk_fake_device_id;
+                ids.VendorID = emulated_display::vendor_id;
+                ids.DeviceID = emulated_display::device_id;
                 ids.SubSystemID = 0;
-                ids.RevisionID = k_dxgk_fake_revision_id;
+                ids.RevisionID = emulated_display::revision_id;
                 ids.BusNumber = 0;
                 ids.DeviceNumber = 0;
                 ids.FunctionNumber = 0;
@@ -4217,7 +4216,7 @@ namespace sogen
             }
 
             case KMTQAITYPE::KMTQAITYPE_QUERY_ADAPTER_UNIQUE_GUID: {
-                GUID unique_guid = k_dxgk_adapter_guid;
+                GUID unique_guid = k_dxgk_adapter_unique_id;
                 return write_query_adapter_info(c, query, unique_guid);
             }
 
@@ -4348,6 +4347,46 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
+        void complete_warp_sync_command(const syscall_context& c, const uint64_t command_ptr, const UINT32 command_length)
+        {
+            constexpr uint32_t k_sync_magic = 0x434E5953;
+            constexpr uint32_t k_ack_magic = 0x4B415953;
+            constexpr uint32_t k_ack_length = 8;
+            if (command_ptr == 0 || command_length < 24)
+            {
+                return;
+            }
+
+            uint32_t magic{};
+            if (!c.emu.try_read_memory(command_ptr, &magic, sizeof(magic)) || magic != k_sync_magic)
+            {
+                return;
+            }
+
+            // SYNC carries a UM completion event at +8 and an error event at +16. After the KM
+            // consumes the DMA buffer it overwrites the header with a sync-ack (magic + length 8).
+            // Leaving SYNC in place is treated as E_OUTOFMEMORY and the D3D11 device is removed.
+            // Signal only the completion event; the error event is DXGI_ERROR_DEVICE_REMOVED.
+            uint64_t completion{};
+            if (!c.emu.try_read_memory(command_ptr + 8, &completion, sizeof(completion)))
+            {
+                return;
+            }
+
+            uint32_t ack_magic = k_ack_magic;
+            uint32_t ack_length = k_ack_length;
+            if (!c.emu.try_write_memory(command_ptr, &ack_magic, sizeof(ack_magic)))
+            {
+                return;
+            }
+
+            c.emu.try_write_memory(command_ptr + 4, &ack_length, sizeof(ack_length));
+            if (auto* entry = c.proc.events.get(completion))
+            {
+                entry->signaled = true;
+            }
+        }
+
         void reserve_dxgk_submission_buffers(const syscall_context& c, const uint32_t command_buffer_size,
                                              const uint32_t allocation_list_count, const uint32_t patch_location_list_count)
         {
@@ -4407,6 +4446,15 @@ namespace sogen
                 if (render.hContext != k_dxgk_context_handle && render.hContext != k_dxgk_device_handle)
                 {
                     dxgk_warn(c, "NtGdiDdDDIRender: Unknown context 0x%X", render.hContext);
+                }
+
+                const auto& command_buffer = c.proc.dxgk.command_buffer;
+                const auto command_offset = static_cast<uint64_t>(render.CommandOffset);
+                const auto command_length = static_cast<uint64_t>(render.CommandLength);
+                if (command_buffer.address != 0 && command_offset <= command_buffer.size &&
+                    command_length <= static_cast<uint64_t>(command_buffer.size) - command_offset)
+                {
+                    complete_warp_sync_command(c, command_buffer.address + command_offset, render.CommandLength);
                 }
 
                 // Clamp the guest-controlled sizes: at least the defaults, but never above the caps above.
@@ -5026,6 +5074,45 @@ namespace sogen
                 open_params.VidPnSourceId = 0;
             });
 
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtGdiDdDDIWaitForSynchronizationObjectFromGpu()
+        {
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtGdiDdDDIWaitForSynchronizationObjectFromCpu(
+            const syscall_context& c, const emulator_object<EMU_D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU> wait_desc)
+        {
+            if (!wait_desc)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            const auto wait = wait_desc.read();
+            if (wait.hAsyncEvent == 0)
+            {
+                return STATUS_SUCCESS;
+            }
+
+            auto* entry = c.proc.events.get(wait.hAsyncEvent);
+            if (!entry)
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            entry->signaled = true;
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtGdiDdDDISignalSynchronizationObjectFromGpu()
+        {
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtGdiDdDDISignalSynchronizationObjectFromCpu()
+        {
             return STATUS_SUCCESS;
         }
 

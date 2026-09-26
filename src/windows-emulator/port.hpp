@@ -303,14 +303,19 @@ namespace sogen
 
     struct port_creation_data
     {
-        uint64_t view_base;
-        int64_t view_size;
+        uint64_t view_base{};
+        int64_t view_size{};
+        ULONG flags{ALPC_PORFLG_ALLOW_LPC_REQUESTS};
+        ULONG sequence_number{};
     };
 
     struct port : ref_counted_object
     {
         uint64_t view_base{};
         int64_t view_size{};
+        ULONG flags{};
+        ULONG sequence_number{};
+        bool disconnected{};
 
         port() = default;
         ~port() override = default;
@@ -325,12 +330,18 @@ namespace sogen
         {
             buffer.write(this->view_base);
             buffer.write(this->view_size);
+            buffer.write(this->flags);
+            buffer.write(this->sequence_number);
+            buffer.write(this->disconnected);
         }
 
         void deserialize_object(utils::buffer_deserializer& buffer) override
         {
             buffer.read(this->view_base);
             buffer.read(this->view_size);
+            buffer.read(this->flags);
+            buffer.read(this->sequence_number);
+            buffer.read(this->disconnected);
         }
 
         virtual void create(windows_emulator& win_emu, const port_creation_data& data)
@@ -338,6 +349,29 @@ namespace sogen
             (void)win_emu;
             view_base = data.view_base;
             view_size = data.view_size;
+            flags = data.flags;
+            sequence_number = data.sequence_number;
+        }
+
+        virtual void prepare_for_state_restore(windows_emulator& win_emu)
+        {
+            (void)win_emu;
+        }
+
+        virtual void restore_after_state_restore(windows_emulator& win_emu)
+        {
+            (void)win_emu;
+        }
+
+        bool disconnect()
+        {
+            if (this->disconnected)
+            {
+                return false;
+            }
+
+            this->disconnected = true;
+            return true;
         }
 
         virtual lpc_message_result handle_message(windows_emulator& win_emu, const lpc_message_context& c);
@@ -348,6 +382,18 @@ namespace sogen
     struct rpc_port : port
     {
         lpc_request_result handle_request(windows_emulator& win_emu, const lpc_request_context& c) override;
+
+        void serialize_object(utils::buffer_serializer& buffer) const override
+        {
+            port::serialize_object(buffer);
+            buffer.write(this->bound_interface_);
+        }
+
+        void deserialize_object(utils::buffer_deserializer& buffer) override
+        {
+            port::deserialize_object(buffer);
+            buffer.read(this->bound_interface_);
+        }
 
         virtual NTSTATUS handle_rpc(windows_emulator& win_emu, uint32_t procedure_id, const lpc_request_context& c,
                                     utils::aligned_binary_writer& writer, std::vector<alpc_reply_handle>& reply_handles) = 0;
@@ -388,6 +434,18 @@ namespace sogen
         }
 
         lpc_message_result handle_message(windows_emulator& win_emu, const lpc_message_context& c) override;
+
+        void prepare_for_state_restore(windows_emulator& win_emu) override
+        {
+            this->assert_validity();
+            this->port_->prepare_for_state_restore(win_emu);
+        }
+
+        void restore_after_state_restore(windows_emulator& win_emu) override
+        {
+            this->assert_validity();
+            this->port_->restore_after_state_restore(win_emu);
+        }
 
         void serialize_object(utils::buffer_serializer& buffer) const override
         {

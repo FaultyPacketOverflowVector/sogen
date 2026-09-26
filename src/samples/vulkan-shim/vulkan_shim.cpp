@@ -1373,6 +1373,16 @@ extern "C"
         request.device = to_object_id(device);
         request.size = pAllocateInfo->allocationSize;
         request.memory_type_index = pAllocateInfo->memoryTypeIndex;
+        for (const auto* next = static_cast<const VkBaseInStructure*>(pAllocateInfo->pNext); next; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
+            {
+                const auto* flags = reinterpret_cast<const VkMemoryAllocateFlagsInfo*>(next);
+                request.flags = flags->flags;
+                request.device_mask = flags->deviceMask;
+                break;
+            }
+        }
 
         gb::allocate_memory_response response{};
         if (!bridge_call(gb::ioctl_allocate_memory, &request, sizeof(request), &response, sizeof(response)))
@@ -1771,6 +1781,114 @@ extern "C"
         request.query_pool = to_object_id(queryPool);
         request.query = query;
         record_command(request.command_buffer, gb::command::cmd_end_query, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                                                                               uint32_t query, VkQueryControlFlags flags, uint32_t index)
+    {
+        gb::cmd_begin_query_indexed_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.query_pool = to_object_id(queryPool);
+        request.query = query;
+        request.flags = static_cast<uint32_t>(flags);
+        request.index = index;
+        record_command(request.command_buffer, gb::command::cmd_begin_query_indexed, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                                                                             uint32_t query, uint32_t index)
+    {
+        gb::cmd_end_query_indexed_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.query_pool = to_object_id(queryPool);
+        request.query = query;
+        request.index = index;
+        record_command(request.command_buffer, gb::command::cmd_end_query_indexed, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
+                                                                                          uint32_t firstBinding, uint32_t bindingCount,
+                                                                                          const VkBuffer* pBuffers,
+                                                                                          const VkDeviceSize* pOffsets,
+                                                                                          const VkDeviceSize* pSizes)
+    {
+        gb::cmd_bind_transform_feedback_buffers_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.first_binding = firstBinding;
+        request.binding_count = bindingCount;
+
+        std::vector<uint8_t> message(sizeof(request) + static_cast<size_t>(bindingCount) * sizeof(gb::transform_feedback_buffer_binding));
+        std::memcpy(message.data(), &request, sizeof(request));
+        size_t cursor = sizeof(request);
+        for (uint32_t i = 0; i < bindingCount; ++i)
+        {
+            const gb::transform_feedback_buffer_binding binding{
+                .buffer = to_object_id(pBuffers[i]), .offset = pOffsets[i], .size = pSizes ? pSizes[i] : VK_WHOLE_SIZE};
+            std::memcpy(message.data() + cursor, &binding, sizeof(binding));
+            cursor += sizeof(binding);
+        }
+        record_command(request.command_buffer, gb::command::cmd_bind_transform_feedback_buffers, message.data(), message.size());
+    }
+
+    static void record_transform_feedback_command(gb::command command, VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
+                                                  uint32_t counterBufferCount, const VkBuffer* pCounterBuffers,
+                                                  const VkDeviceSize* pCounterBufferOffsets)
+    {
+        gb::cmd_transform_feedback_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.first_counter_buffer = firstCounterBuffer;
+        request.counter_buffer_count = counterBufferCount;
+        request.has_counter_buffers = pCounterBuffers ? 1u : 0u;
+        request.has_counter_buffer_offsets = pCounterBufferOffsets ? 1u : 0u;
+
+        std::vector<uint8_t> message(sizeof(request) +
+                                     static_cast<size_t>(counterBufferCount) * sizeof(gb::transform_feedback_counter_buffer));
+        std::memcpy(message.data(), &request, sizeof(request));
+        size_t cursor = sizeof(request);
+        for (uint32_t i = 0; i < counterBufferCount; ++i)
+        {
+            const gb::transform_feedback_counter_buffer counter{.buffer =
+                                                                    pCounterBuffers ? to_object_id(pCounterBuffers[i]) : gb::null_object,
+                                                                .offset = pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0};
+            std::memcpy(message.data() + cursor, &counter, sizeof(counter));
+            cursor += sizeof(counter);
+        }
+        record_command(request.command_buffer, command, message.data(), message.size());
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+                                                                                    uint32_t firstCounterBuffer,
+                                                                                    uint32_t counterBufferCount,
+                                                                                    const VkBuffer* pCounterBuffers,
+                                                                                    const VkDeviceSize* pCounterBufferOffsets)
+    {
+        record_transform_feedback_command(gb::command::cmd_begin_transform_feedback, commandBuffer, firstCounterBuffer, counterBufferCount,
+                                          pCounterBuffers, pCounterBufferOffsets);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+                                                                                  uint32_t firstCounterBuffer, uint32_t counterBufferCount,
+                                                                                  const VkBuffer* pCounterBuffers,
+                                                                                  const VkDeviceSize* pCounterBufferOffsets)
+    {
+        record_transform_feedback_command(gb::command::cmd_end_transform_feedback, commandBuffer, firstCounterBuffer, counterBufferCount,
+                                          pCounterBuffers, pCounterBufferOffsets);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instanceCount,
+                                                                                   uint32_t firstInstance, VkBuffer counterBuffer,
+                                                                                   VkDeviceSize counterBufferOffset, uint32_t counterOffset,
+                                                                                   uint32_t vertexStride)
+    {
+        gb::cmd_draw_indirect_byte_count_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.counter_buffer = to_object_id(counterBuffer);
+        request.counter_buffer_offset = counterBufferOffset;
+        request.counter_offset = counterOffset;
+        request.vertex_stride = vertexStride;
+        request.instance_count = instanceCount;
+        request.first_instance = firstInstance;
+        record_command(request.command_buffer, gb::command::cmd_draw_indirect_byte_count, &request, sizeof(request));
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer commandBuffer,
@@ -3818,13 +3936,23 @@ extern "C"
         VkResult overall = VK_SUCCESS;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i)
         {
-            gb::queue_present_request request{};
-            request.queue = to_object_id(queue);
-            request.swapchain = to_object_id(pPresentInfo->pSwapchains[i]);
-            request.image_index = pPresentInfo->pImageIndices[i];
+            const uint32_t wait_count = i == 0 ? pPresentInfo->waitSemaphoreCount : 0;
+            std::vector<uint8_t> message(sizeof(gb::queue_present_request) + static_cast<size_t>(wait_count) * sizeof(gb::object_id));
+            auto* request = reinterpret_cast<gb::queue_present_request*>(message.data());
+            request->queue = to_object_id(queue);
+            request->swapchain = to_object_id(pPresentInfo->pSwapchains[i]);
+            request->image_index = pPresentInfo->pImageIndices[i];
+            request->wait_semaphore_count = wait_count;
+
+            auto* waits = reinterpret_cast<gb::object_id*>(message.data() + sizeof(*request));
+            for (uint32_t wait_index = 0; wait_index < wait_count; ++wait_index)
+            {
+                waits[wait_index] = to_object_id(pPresentInfo->pWaitSemaphores[wait_index]);
+            }
 
             gb::result_response response{};
-            const bool ok = bridge_call(gb::ioctl_queue_present, &request, sizeof(request), &response, sizeof(response));
+            const bool ok =
+                bridge_call(gb::ioctl_queue_present, message.data(), static_cast<DWORD>(message.size()), &response, sizeof(response));
             const VkResult result = ok ? static_cast<VkResult>(response.vk_result) : VK_ERROR_INITIALIZATION_FAILED;
             if (pPresentInfo->pResults)
             {
@@ -3841,11 +3969,16 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo,
                                                                               const VkAllocationCallbacks*, VkShaderModule* pShaderModule)
     {
+        if (pCreateInfo->codeSize > UINT32_MAX - sizeof(gb::create_shader_module_request))
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
         const auto code_size = static_cast<uint32_t>(pCreateInfo->codeSize);
         std::vector<uint8_t> message(sizeof(gb::create_shader_module_request) + code_size);
         gb::create_shader_module_request header{};
         header.device = to_object_id(device);
         header.code_size = code_size;
+        header.flags = static_cast<uint32_t>(pCreateInfo->flags);
         std::memcpy(message.data(), &header, sizeof(header));
         std::memcpy(message.data() + sizeof(header), pCreateInfo->pCode, code_size);
 
@@ -3866,6 +3999,56 @@ extern "C"
                                                                            const VkAllocationCallbacks*)
     {
         destroy_device_child(gb::ioctl_destroy_shader_module, device, shaderModule);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetShaderModuleIdentifierEXT(VkDevice device, VkShaderModule shaderModule,
+                                                                                    VkShaderModuleIdentifierEXT* pIdentifier)
+    {
+        gb::device_child_request request{};
+        request.device = to_object_id(device);
+        request.object = to_object_id(shaderModule);
+
+        gb::shader_module_identifier_response response{};
+        if (!bridge_call(gb::ioctl_get_shader_module_identifier, &request, sizeof(request), &response, sizeof(response)) ||
+            response.vk_result != VK_SUCCESS)
+        {
+            pIdentifier->identifierSize = 0;
+            return;
+        }
+
+        pIdentifier->identifierSize = std::min<uint32_t>(response.identifier_size, VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT);
+        std::memcpy(pIdentifier->identifier, response.identifier.data(), pIdentifier->identifierSize);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetShaderModuleCreateInfoIdentifierEXT(VkDevice device,
+                                                                                              const VkShaderModuleCreateInfo* pCreateInfo,
+                                                                                              VkShaderModuleIdentifierEXT* pIdentifier)
+    {
+        pIdentifier->identifierSize = 0;
+        if (pCreateInfo->codeSize > UINT32_MAX - sizeof(gb::create_shader_module_request))
+        {
+            return;
+        }
+
+        const auto code_size = static_cast<uint32_t>(pCreateInfo->codeSize);
+        std::vector<uint8_t> message(sizeof(gb::create_shader_module_request) + code_size);
+        gb::create_shader_module_request header{};
+        header.device = to_object_id(device);
+        header.code_size = code_size;
+        header.flags = static_cast<uint32_t>(pCreateInfo->flags);
+        std::memcpy(message.data(), &header, sizeof(header));
+        std::memcpy(message.data() + sizeof(header), pCreateInfo->pCode, code_size);
+
+        gb::shader_module_identifier_response response{};
+        if (!bridge_call(gb::ioctl_get_shader_module_create_info_identifier, message.data(), static_cast<DWORD>(message.size()), &response,
+                         sizeof(response)) ||
+            response.vk_result != VK_SUCCESS)
+        {
+            return;
+        }
+
+        pIdentifier->identifierSize = std::min<uint32_t>(response.identifier_size, VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT);
+        std::memcpy(pIdentifier->identifier, response.identifier.data(), pIdentifier->identifierSize);
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice device, const VkImageViewCreateInfo* pCreateInfo,
@@ -4028,6 +4211,17 @@ extern "C"
         gb::create_descriptor_set_layout_request header{};
         header.device = to_object_id(device);
         header.binding_count = pCreateInfo->bindingCount;
+        header.flags = pCreateInfo->flags;
+
+        const VkDescriptorSetLayoutBindingFlagsCreateInfo* binding_flags = nullptr;
+        for (const auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO)
+            {
+                binding_flags = reinterpret_cast<const VkDescriptorSetLayoutBindingFlagsCreateInfo*>(next);
+                break;
+            }
+        }
 
         std::vector<uint8_t> message(sizeof(header) +
                                      static_cast<size_t>(header.binding_count) * sizeof(gb::descriptor_set_layout_binding));
@@ -4040,6 +4234,10 @@ extern "C"
             wire.descriptor_type = static_cast<uint32_t>(b.descriptorType);
             wire.descriptor_count = b.descriptorCount;
             wire.stage_flags = b.stageFlags;
+            if (binding_flags && i < binding_flags->bindingCount)
+            {
+                wire.binding_flags = binding_flags->pBindingFlags[i];
+            }
             std::memcpy(message.data() + sizeof(header) + i * sizeof(wire), &wire, sizeof(wire));
         }
 
@@ -4073,6 +4271,16 @@ extern "C"
         header.device = to_object_id(device);
         header.max_sets = pCreateInfo->maxSets;
         header.pool_size_count = pCreateInfo->poolSizeCount;
+        header.flags = pCreateInfo->flags;
+        for (const auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO)
+            {
+                const auto* inline_uniform_blocks = reinterpret_cast<const VkDescriptorPoolInlineUniformBlockCreateInfo*>(next);
+                header.max_inline_uniform_block_bindings = inline_uniform_blocks->maxInlineUniformBlockBindings;
+                break;
+            }
+        }
 
         std::vector<uint8_t> message(sizeof(header) + static_cast<size_t>(header.pool_size_count) * sizeof(gb::descriptor_pool_size));
         std::memcpy(message.data(), &header, sizeof(header));
@@ -4125,17 +4333,41 @@ extern "C"
                                                                                   VkDescriptorSet* pDescriptorSets)
     {
         const uint32_t count = pAllocateInfo->descriptorSetCount;
+        const VkDescriptorSetVariableDescriptorCountAllocateInfo* variable_descriptor_counts = nullptr;
+        for (const auto* next = static_cast<const VkBaseInStructure*>(pAllocateInfo->pNext); next; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO)
+            {
+                variable_descriptor_counts = reinterpret_cast<const VkDescriptorSetVariableDescriptorCountAllocateInfo*>(next);
+                break;
+            }
+        }
+        const uint32_t variable_descriptor_count_count = variable_descriptor_counts ? variable_descriptor_counts->descriptorSetCount : 0;
+        if (variable_descriptor_count_count != 0 &&
+            (variable_descriptor_count_count != count || !variable_descriptor_counts->pDescriptorCounts))
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
         gb::allocate_descriptor_sets_request header{};
         header.device = to_object_id(device);
         header.descriptor_pool = to_object_id(pAllocateInfo->descriptorPool);
         header.set_count = count;
+        header.variable_descriptor_count_count = variable_descriptor_count_count;
 
-        std::vector<uint8_t> message(sizeof(header) + static_cast<size_t>(count) * sizeof(gb::object_id));
+        const size_t layouts_size = static_cast<size_t>(count) * sizeof(gb::object_id);
+        const size_t variable_counts_size = static_cast<size_t>(header.variable_descriptor_count_count) * sizeof(uint32_t);
+        std::vector<uint8_t> message(sizeof(header) + layouts_size + variable_counts_size);
         std::memcpy(message.data(), &header, sizeof(header));
         for (uint32_t i = 0; i < count; ++i)
         {
             const gb::object_id id = to_object_id(pAllocateInfo->pSetLayouts[i]);
             std::memcpy(message.data() + sizeof(header) + i * sizeof(id), &id, sizeof(id));
+        }
+        if (variable_counts_size != 0)
+        {
+            std::memcpy(message.data() + sizeof(header) + layouts_size, variable_descriptor_counts->pDescriptorCounts,
+                        variable_counts_size);
         }
 
         std::vector<uint8_t> out(sizeof(gb::allocate_descriptor_sets_response) + static_cast<size_t>(count) * sizeof(gb::object_id));
@@ -4180,12 +4412,47 @@ extern "C"
                                                                             const VkWriteDescriptorSet* pDescriptorWrites, uint32_t,
                                                                             const VkCopyDescriptorSet*)
     {
-        // Descriptor copies are not modeled; only writes are forwarded. Each VkWriteDescriptorSet is
-        // flattened to `descriptorCount` single-descriptor wire writes.
+        // Descriptor copies are not modeled; only writes are forwarded. Non-inline writes are flattened
+        // to `descriptorCount` single-descriptor wire writes.
         std::vector<gb::descriptor_write> writes;
+        std::vector<uint8_t> inline_uniform_data;
         for (uint32_t w = 0; w < descriptorWriteCount; ++w)
         {
             const VkWriteDescriptorSet& src = pDescriptorWrites[w];
+            if (src.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+            {
+                const VkWriteDescriptorSetInlineUniformBlock* inline_uniform_block = nullptr;
+                for (const auto* next = static_cast<const VkBaseInStructure*>(src.pNext); next; next = next->pNext)
+                {
+                    if (next->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK)
+                    {
+                        inline_uniform_block = reinterpret_cast<const VkWriteDescriptorSetInlineUniformBlock*>(next);
+                        break;
+                    }
+                }
+                if (!inline_uniform_block || inline_uniform_block->dataSize != src.descriptorCount ||
+                    (inline_uniform_block->dataSize != 0 && !inline_uniform_block->pData) ||
+                    inline_uniform_data.size() > UINT32_MAX - inline_uniform_block->dataSize)
+                {
+                    continue;
+                }
+
+                gb::descriptor_write wire{};
+                wire.dst_set = to_object_id(src.dstSet);
+                wire.dst_binding = src.dstBinding;
+                wire.dst_array_element = src.dstArrayElement;
+                wire.descriptor_type = static_cast<uint32_t>(src.descriptorType);
+                wire.inline_uniform_data_offset = static_cast<uint32_t>(inline_uniform_data.size());
+                wire.inline_uniform_data_size = inline_uniform_block->dataSize;
+                if (inline_uniform_block->dataSize != 0)
+                {
+                    const auto* data = static_cast<const uint8_t*>(inline_uniform_block->pData);
+                    inline_uniform_data.insert(inline_uniform_data.end(), data, data + inline_uniform_block->dataSize);
+                }
+                writes.push_back(wire);
+                continue;
+            }
+
             for (uint32_t e = 0; e < src.descriptorCount; ++e)
             {
                 gb::descriptor_write wire{};
@@ -4216,6 +4483,7 @@ extern "C"
         gb::update_descriptor_sets_request header{};
         header.device = to_object_id(device);
         header.write_count = static_cast<uint32_t>(writes.size());
+        header.inline_uniform_data_size = static_cast<uint32_t>(inline_uniform_data.size());
 
         // Append to the pending batch instead of issuing an IOCTL now (drained before the next bridge call).
         const auto* header_bytes = reinterpret_cast<const uint8_t*>(&header);
@@ -4227,6 +4495,7 @@ extern "C"
             g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), write_bytes,
                                                 write_bytes + writes.size() * sizeof(gb::descriptor_write));
         }
+        g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), inline_uniform_data.begin(), inline_uniform_data.end());
     }
 
     // Descriptor update templates are lowered entirely inside the shim: the template definition is kept
@@ -4282,10 +4551,12 @@ extern "C"
         std::vector<std::vector<VkDescriptorImageInfo>> image_infos;
         std::vector<std::vector<VkDescriptorBufferInfo>> buffer_infos;
         std::vector<std::vector<VkBufferView>> texel_views;
+        std::vector<VkWriteDescriptorSetInlineUniformBlock> inline_uniform_blocks;
         writes.reserve(tmpl->entries.size());
         image_infos.reserve(tmpl->entries.size());
         buffer_infos.reserve(tmpl->entries.size());
         texel_views.reserve(tmpl->entries.size());
+        inline_uniform_blocks.reserve(tmpl->entries.size());
 
         const auto* base = static_cast<const uint8_t*>(pData);
         for (const auto& entry : tmpl->entries)
@@ -4298,7 +4569,15 @@ extern "C"
             write.descriptorCount = entry.descriptorCount;
             write.descriptorType = entry.descriptorType;
 
-            if (is_image_descriptor(entry.descriptorType))
+            if (entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+            {
+                auto& inline_uniform_block = inline_uniform_blocks.emplace_back();
+                inline_uniform_block.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK;
+                inline_uniform_block.dataSize = entry.descriptorCount;
+                inline_uniform_block.pData = base + entry.offset;
+                write.pNext = &inline_uniform_block;
+            }
+            else if (is_image_descriptor(entry.descriptorType))
             {
                 auto& arr = image_infos.emplace_back();
                 arr.reserve(entry.descriptorCount);
@@ -4408,12 +4687,13 @@ extern "C"
         // Initialize the one output-chain structure relevant to descriptor-layout support. Unknown output
         // structures make the query unsupported rather than leaving partially initialized data behind.
         bool unsupported_output_chain = false;
+        VkDescriptorSetVariableDescriptorCountLayoutSupport* variable_support = nullptr;
         for (auto* base = static_cast<VkBaseOutStructure*>(pSupport->pNext); base != nullptr; base = base->pNext)
         {
             if (base->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT)
             {
-                auto* const variable = reinterpret_cast<VkDescriptorSetVariableDescriptorCountLayoutSupport*>(base);
-                variable->maxVariableDescriptorCount = 0;
+                variable_support = reinterpret_cast<VkDescriptorSetVariableDescriptorCountLayoutSupport*>(base);
+                variable_support->maxVariableDescriptorCount = 0;
             }
             else
             {
@@ -4426,10 +4706,17 @@ extern "C"
             return;
         }
 
-        // Keep this query aligned with what vkCreateDescriptorSetLayout currently marshals. Layout flags,
-        // input pNext structures (including binding flags), and immutable samplers are not represented by
-        // the create command, so claiming support for them would recreate the original false positive.
-        if (pCreateInfo->flags != 0 || pCreateInfo->pNext != nullptr)
+        const VkDescriptorSetLayoutBindingFlagsCreateInfo* binding_flags = nullptr;
+        for (const auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next; next = next->pNext)
+        {
+            if (next->sType != VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO)
+            {
+                return;
+            }
+            binding_flags = reinterpret_cast<const VkDescriptorSetLayoutBindingFlagsCreateInfo*>(next);
+        }
+        if (binding_flags && binding_flags->bindingCount != 0 &&
+            (binding_flags->bindingCount != pCreateInfo->bindingCount || !binding_flags->pBindingFlags))
         {
             return;
         }
@@ -4444,6 +4731,7 @@ extern "C"
         gb::get_descriptor_set_layout_support_request header{};
         header.device = to_object_id(device);
         header.binding_count = pCreateInfo->bindingCount;
+        header.flags = pCreateInfo->flags;
         if (header.binding_count > (static_cast<size_t>(UINT32_MAX) - sizeof(header)) / sizeof(gb::descriptor_set_layout_binding))
         {
             return;
@@ -4455,12 +4743,17 @@ extern "C"
         for (uint32_t i = 0; i < header.binding_count; ++i)
         {
             const VkDescriptorSetLayoutBinding& b = pCreateInfo->pBindings[i];
-            const gb::descriptor_set_layout_binding wire{
+            gb::descriptor_set_layout_binding wire{
                 .binding = b.binding,
                 .descriptor_type = static_cast<uint32_t>(b.descriptorType),
                 .descriptor_count = b.descriptorCount,
                 .stage_flags = b.stageFlags,
+                .binding_flags = 0,
             };
+            if (binding_flags && binding_flags->bindingCount != 0)
+            {
+                wire.binding_flags = binding_flags->pBindingFlags[i];
+            }
             std::memcpy(message.data() + sizeof(header) + static_cast<size_t>(i) * sizeof(wire), &wire, sizeof(wire));
         }
 
@@ -4473,6 +4766,10 @@ extern "C"
         }
 
         pSupport->supported = response.supported ? VK_TRUE : VK_FALSE;
+        if (variable_support)
+        {
+            variable_support->maxVariableDescriptorCount = response.max_variable_descriptor_count;
+        }
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetDescriptorSetLayoutSupportKHR(VkDevice device,
@@ -4551,39 +4848,188 @@ extern "C"
     {
         destroy_device_child(gb::ioctl_destroy_sampler, device, sampler);
     }
+}
 
-    namespace
+extern "C"
+{
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice device,
+                                                                               const VkPipelineCacheCreateInfo* pCreateInfo,
+                                                                               const VkAllocationCallbacks*,
+                                                                               VkPipelineCache* pPipelineCache)
     {
-        // DXVK (VK_KHR_maintenance5) chains the SPIR-V inline through a VkShaderModuleCreateInfo on the
-        // stage's pNext instead of passing a VkShaderModule. The bridge models explicit shader modules,
-        // so materialize a temporary one from the inline code. Returns the module to use (and sets
-        // `owned` when the caller must destroy it after pipeline creation).
-        VkShaderModule resolve_stage_module(VkDevice device, const VkPipelineShaderStageCreateInfo& stage, bool& owned)
+        if (!pCreateInfo || !pPipelineCache || (pCreateInfo->initialDataSize > 0 && !pCreateInfo->pInitialData) ||
+            pCreateInfo->initialDataSize > UINT32_MAX)
         {
-            owned = false;
-            if (stage.module != VK_NULL_HANDLE)
-            {
-                return stage.module;
-            }
-            for (const auto* next = static_cast<const VkBaseInStructure*>(stage.pNext); next != nullptr; next = next->pNext)
-            {
-                if (next->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
-                {
-                    const auto* info = reinterpret_cast<const VkShaderModuleCreateInfo*>(next);
-                    VkShaderModule module = VK_NULL_HANDLE;
-                    if (vkCreateShaderModule(device, info, nullptr, &module) == VK_SUCCESS)
-                    {
-                        owned = true;
-                        return module;
-                    }
-                    break;
-                }
-            }
-            return VK_NULL_HANDLE;
+            return VK_ERROR_INITIALIZATION_FAILED;
         }
+
+        gb::create_pipeline_cache_request request{};
+        request.device = to_object_id(device);
+        request.flags = static_cast<uint32_t>(pCreateInfo->flags);
+        request.initial_data_size = static_cast<uint32_t>(pCreateInfo->initialDataSize);
+        if (request.initial_data_size > MAXDWORD - sizeof(request))
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+
+        std::vector<uint8_t> message(sizeof(request) + request.initial_data_size);
+        std::memcpy(message.data(), &request, sizeof(request));
+        if (request.initial_data_size > 0)
+        {
+            std::memcpy(message.data() + sizeof(request), pCreateInfo->pInitialData, request.initial_data_size);
+        }
+
+        gb::object_response response{};
+        if (!bridge_call(gb::ioctl_create_pipeline_cache, message.data(), static_cast<DWORD>(message.size()), &response, sizeof(response)))
+        {
+            *pPipelineCache = VK_NULL_HANDLE;
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        *pPipelineCache = response.vk_result == VK_SUCCESS ? to_handle<VkPipelineCache>(response.object) : VK_NULL_HANDLE;
+        return static_cast<VkResult>(response.vk_result);
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache,
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice device, VkPipelineCache pipelineCache,
+                                                                            const VkAllocationCallbacks*)
+    {
+        destroy_device_child(gb::ioctl_destroy_pipeline_cache, device, pipelineCache);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache,
+                                                                                size_t* pDataSize, void* pData)
+    {
+        if (!pDataSize)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        const size_t capacity = pData ? *pDataSize : 0;
+        if (capacity > MAXDWORD - sizeof(gb::get_pipeline_cache_data_response))
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+
+        gb::get_pipeline_cache_data_request request{};
+        request.device = to_object_id(device);
+        request.pipeline_cache = to_object_id(pipelineCache);
+        request.max_data_size = capacity;
+        request.has_data = pData != nullptr;
+
+        std::vector<std::byte> buffer(sizeof(gb::get_pipeline_cache_data_response) + capacity);
+        if (!bridge_call(gb::ioctl_get_pipeline_cache_data, &request, sizeof(request), buffer.data(), static_cast<DWORD>(buffer.size())))
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        const auto* response = reinterpret_cast<const gb::get_pipeline_cache_data_response*>(buffer.data());
+        const size_t written = std::min<size_t>(static_cast<size_t>(response->data_size), capacity);
+        if (pData && written > 0)
+        {
+            std::memcpy(pData, buffer.data() + sizeof(gb::get_pipeline_cache_data_response), written);
+        }
+        *pDataSize = static_cast<size_t>(response->data_size);
+        return static_cast<VkResult>(response->vk_result);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkMergePipelineCaches(VkDevice device, VkPipelineCache dstCache,
+                                                                               uint32_t srcCacheCount, const VkPipelineCache* pSrcCaches)
+    {
+        if (srcCacheCount > 0 && !pSrcCaches)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (srcCacheCount > (MAXDWORD - sizeof(gb::merge_pipeline_caches_request)) / sizeof(gb::object_id))
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+
+        gb::merge_pipeline_caches_request request{};
+        request.device = to_object_id(device);
+        request.destination_cache = to_object_id(dstCache);
+        request.source_count = srcCacheCount;
+
+        const size_t message_size = sizeof(request) + static_cast<size_t>(srcCacheCount) * sizeof(gb::object_id);
+        std::vector<uint8_t> message(message_size);
+        std::memcpy(message.data(), &request, sizeof(request));
+        for (uint32_t i = 0; i < srcCacheCount; ++i)
+        {
+            const gb::object_id source = to_object_id(pSrcCaches[i]);
+            std::memcpy(message.data() + sizeof(request) + static_cast<size_t>(i) * sizeof(source), &source, sizeof(source));
+        }
+
+        gb::result_response response{};
+        if (!bridge_call(gb::ioctl_merge_pipeline_caches, message.data(), static_cast<DWORD>(message.size()), &response, sizeof(response)))
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        return static_cast<VkResult>(response.vk_result);
+    }
+}
+
+namespace
+{
+    struct resolved_stage_source
+    {
+        gb::shader_stage_source wire{};
+        VkShaderModule owned_module{VK_NULL_HANDLE};
+        bool valid{};
+    };
+
+    resolved_stage_source resolve_stage_source(VkDevice device, const VkPipelineShaderStageCreateInfo& stage)
+    {
+        resolved_stage_source result{};
+        if (stage.module != VK_NULL_HANDLE)
+        {
+            result.wire.module = to_object_id(stage.module);
+            result.valid = true;
+            return result;
+        }
+
+        const VkShaderModuleCreateInfo* inline_info = nullptr;
+        const VkPipelineShaderStageModuleIdentifierCreateInfoEXT* identifier_info = nullptr;
+        for (const auto* next = static_cast<const VkBaseInStructure*>(stage.pNext); next != nullptr; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
+            {
+                inline_info = reinterpret_cast<const VkShaderModuleCreateInfo*>(next);
+            }
+            else if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT)
+            {
+                identifier_info = reinterpret_cast<const VkPipelineShaderStageModuleIdentifierCreateInfoEXT*>(next);
+            }
+        }
+
+        if (inline_info && identifier_info)
+        {
+            return result;
+        }
+
+        if (identifier_info)
+        {
+            if (identifier_info->identifierSize == 0 || identifier_info->identifierSize > gb::max_shader_module_identifier_size ||
+                !identifier_info->pIdentifier)
+            {
+                return result;
+            }
+            result.wire.identifier_size = identifier_info->identifierSize;
+            std::memcpy(result.wire.identifier.data(), identifier_info->pIdentifier, identifier_info->identifierSize);
+            result.valid = true;
+            return result;
+        }
+
+        if (inline_info && vkCreateShaderModule(device, inline_info, nullptr, &result.owned_module) == VK_SUCCESS)
+        {
+            result.wire.module = to_object_id(result.owned_module);
+            result.valid = true;
+        }
+        return result;
+    }
+
+}
+
+extern "C"
+{
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                                                                                    uint32_t createInfoCount,
                                                                                    const VkGraphicsPipelineCreateInfo* pCreateInfos,
                                                                                    const VkAllocationCallbacks*, VkPipeline* pPipelines)
@@ -4593,30 +5039,48 @@ extern "C"
         {
             const VkGraphicsPipelineCreateInfo& ci = pCreateInfos[i];
 
-            gb::object_id vertex_shader = gb::null_object;
-            gb::object_id fragment_shader = gb::null_object;
+            resolved_stage_source vertex_shader{};
+            resolved_stage_source fragment_shader{};
             const VkSpecializationInfo* vs_spec = nullptr;
             const VkSpecializationInfo* fs_spec = nullptr;
-            VkShaderModule owned_modules[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-            uint32_t owned_count = 0;
+            bool stages_valid = true;
             for (uint32_t s = 0; s < ci.stageCount; ++s)
             {
-                bool owned = false;
-                const VkShaderModule module = resolve_stage_module(device, ci.pStages[s], owned);
-                if (owned && owned_count < 2)
+                resolved_stage_source source = resolve_stage_source(device, ci.pStages[s]);
+                if (!source.valid)
                 {
-                    owned_modules[owned_count++] = module;
+                    stages_valid = false;
+                    break;
                 }
                 if (ci.pStages[s].stage == VK_SHADER_STAGE_VERTEX_BIT)
                 {
-                    vertex_shader = to_object_id(module);
+                    vertex_shader = source;
                     vs_spec = ci.pStages[s].pSpecializationInfo;
                 }
                 else if (ci.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
                 {
-                    fragment_shader = to_object_id(module);
+                    fragment_shader = source;
                     fs_spec = ci.pStages[s].pSpecializationInfo;
                 }
+                else if (source.owned_module != VK_NULL_HANDLE)
+                {
+                    vkDestroyShaderModule(device, source.owned_module, nullptr);
+                }
+            }
+            stages_valid = stages_valid && vertex_shader.valid && fragment_shader.valid;
+            if (!stages_valid)
+            {
+                if (vertex_shader.owned_module != VK_NULL_HANDLE)
+                {
+                    vkDestroyShaderModule(device, vertex_shader.owned_module, nullptr);
+                }
+                if (fragment_shader.owned_module != VK_NULL_HANDLE)
+                {
+                    vkDestroyShaderModule(device, fragment_shader.owned_module, nullptr);
+                }
+                pPipelines[i] = VK_NULL_HANDLE;
+                overall = VK_ERROR_INITIALIZATION_FAILED;
+                continue;
             }
             const uint32_t vs_spec_entries = (vs_spec && vs_spec->pMapEntries) ? vs_spec->mapEntryCount : 0u;
             const uint32_t vs_spec_bytes = (vs_spec && vs_spec->pData) ? static_cast<uint32_t>(vs_spec->dataSize) : 0u;
@@ -4662,10 +5126,11 @@ extern "C"
 
             gb::create_graphics_pipeline_request request{};
             request.device = to_object_id(device);
+            request.pipeline_cache = to_object_id(pipelineCache);
             request.render_pass = to_object_id(ci.renderPass);
             request.pipeline_layout = to_object_id(ci.layout);
-            request.vertex_shader = vertex_shader;
-            request.fragment_shader = fragment_shader;
+            request.vertex_shader = vertex_shader.wire;
+            request.fragment_shader = fragment_shader.wire;
             request.flags = static_cast<uint32_t>(ci.flags & ~VK_PIPELINE_CREATE_DERIVATIVE_BIT);
             request.width = width;
             request.height = height;
@@ -4683,6 +5148,23 @@ extern "C"
             request.primitive_topology = static_cast<uint32_t>(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 
             request.primitive_restart_enable = 0;
+            request.rasterization_stream = UINT32_MAX;
+
+            if (ci.pRasterizationState)
+            {
+                for (const auto* base = static_cast<const VkBaseInStructure*>(ci.pRasterizationState->pNext); base != nullptr;
+                     base = base->pNext)
+                {
+                    if (base->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT)
+                    {
+                        continue;
+                    }
+                    const auto* stream = reinterpret_cast<const VkPipelineRasterizationStateStreamCreateInfoEXT*>(base);
+                    request.rasterization_stream = stream->rasterizationStream;
+                    request.rasterization_stream_flags = static_cast<uint32_t>(stream->flags);
+                    break;
+                }
+            }
 
             if (ci.pInputAssemblyState)
             {
@@ -4822,15 +5304,19 @@ extern "C"
                 pPipelines[i] = to_handle<VkPipeline>(response.object);
             }
 
-            for (uint32_t m = 0; m < owned_count; ++m)
+            if (vertex_shader.owned_module != VK_NULL_HANDLE)
             {
-                vkDestroyShaderModule(device, owned_modules[m], nullptr);
+                vkDestroyShaderModule(device, vertex_shader.owned_module, nullptr);
+            }
+            if (fragment_shader.owned_module != VK_NULL_HANDLE)
+            {
+                vkDestroyShaderModule(device, fragment_shader.owned_module, nullptr);
             }
         }
         return overall;
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice device, VkPipelineCache,
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
                                                                                   uint32_t createInfoCount,
                                                                                   const VkComputePipelineCreateInfo* pCreateInfos,
                                                                                   const VkAllocationCallbacks*, VkPipeline* pPipelines)
@@ -4840,13 +5326,19 @@ extern "C"
         {
             const VkComputePipelineCreateInfo& ci = pCreateInfos[i];
 
-            bool owned = false;
-            const VkShaderModule module = resolve_stage_module(device, ci.stage, owned);
+            const resolved_stage_source shader = resolve_stage_source(device, ci.stage);
+            if (!shader.valid)
+            {
+                pPipelines[i] = VK_NULL_HANDLE;
+                overall = VK_ERROR_INITIALIZATION_FAILED;
+                continue;
+            }
 
             gb::create_compute_pipeline_request request{};
             request.device = to_object_id(device);
+            request.pipeline_cache = to_object_id(pipelineCache);
             request.pipeline_layout = to_object_id(ci.layout);
-            request.shader_module = to_object_id(module);
+            request.shader = shader.wire;
             request.flags = static_cast<uint32_t>(ci.flags & ~VK_PIPELINE_CREATE_DERIVATIVE_BIT);
 
             gb::create_compute_pipeline_response response{};
@@ -4861,9 +5353,9 @@ extern "C"
                 pPipelines[i] = to_handle<VkPipeline>(response.pipeline);
             }
 
-            if (owned)
+            if (shader.owned_module != VK_NULL_HANDLE)
             {
-                vkDestroyShaderModule(device, module, nullptr);
+                vkDestroyShaderModule(device, shader.owned_module, nullptr);
             }
         }
         return overall;
@@ -5447,8 +5939,15 @@ extern "C"
             {.name = "vkGetQueryPoolResults", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetQueryPoolResults)},
             {.name = "vkCmdResetQueryPool", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdResetQueryPool)},
             {.name = "vkCmdBeginQuery", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginQuery)},
+            {.name = "vkCmdBeginQueryIndexedEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginQueryIndexedEXT)},
             {.name = "vkCmdEndQuery", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndQuery)},
             {.name = "vkCmdCopyQueryPoolResults", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyQueryPoolResults)},
+            {.name = "vkCmdEndQueryIndexedEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndQueryIndexedEXT)},
+            {.name = "vkCmdBindTransformFeedbackBuffersEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindTransformFeedbackBuffersEXT)},
+            {.name = "vkCmdBeginTransformFeedbackEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginTransformFeedbackEXT)},
+            {.name = "vkCmdEndTransformFeedbackEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndTransformFeedbackEXT)},
+            {.name = "vkCmdDrawIndirectByteCountEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdDrawIndirectByteCountEXT)},
             {.name = "vkCmdWriteTimestamp", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWriteTimestamp)},
             {.name = "vkCmdWriteTimestamp2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWriteTimestamp2)},
             {.name = "vkCmdWriteTimestamp2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWriteTimestamp2KHR)},
@@ -5516,6 +6015,9 @@ extern "C"
             {.name = "vkQueuePresentKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueuePresentKHR)},
             {.name = "vkCreateShaderModule", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateShaderModule)},
             {.name = "vkDestroyShaderModule", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyShaderModule)},
+            {.name = "vkGetShaderModuleCreateInfoIdentifierEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetShaderModuleCreateInfoIdentifierEXT)},
+            {.name = "vkGetShaderModuleIdentifierEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetShaderModuleIdentifierEXT)},
             {.name = "vkCreateImageView", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateImageView)},
             {.name = "vkDestroyImageView", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyImageView)},
             {.name = "vkCreateRenderPass", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateRenderPass)},
@@ -5554,6 +6056,10 @@ extern "C"
             {.name = "vkUpdateDescriptorSetWithTemplateKHR",
              .func = reinterpret_cast<PFN_vkVoidFunction>(vkUpdateDescriptorSetWithTemplate)},
             {.name = "vkCmdBindDescriptorSets", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindDescriptorSets)},
+            {.name = "vkCreatePipelineCache", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreatePipelineCache)},
+            {.name = "vkDestroyPipelineCache", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyPipelineCache)},
+            {.name = "vkGetPipelineCacheData", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetPipelineCacheData)},
+            {.name = "vkMergePipelineCaches", .func = reinterpret_cast<PFN_vkVoidFunction>(vkMergePipelineCaches)},
             {.name = "vkCreateGraphicsPipelines", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateGraphicsPipelines)},
             {.name = "vkCreateComputePipelines", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateComputePipelines)},
             {.name = "vkDestroyPipeline", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyPipeline)},

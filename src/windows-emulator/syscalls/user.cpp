@@ -1,4 +1,5 @@
 #include "../std_include.hpp"
+#include "../emulated_display_adapter.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
 #include "../win32k_userconnect.hpp"
@@ -339,12 +340,12 @@ namespace sogen
             }
 
             const auto index = static_cast<uint32_t>(h.value.id);
-            if (index == 0 || index >= user_handle_table::MAX_HANDLES)
+            if (index == 0 || index >= user_handle_table::MAX_HANDLE_INDICES)
             {
                 return;
             }
 
-            c.proc.user_handles.get_handle_table().access([&](USER_HANDLEENTRY& entry) { entry.pOwner = owner; }, index);
+            c.proc.user_handles.set_owner(index, owner);
         }
 
         void invalidate_window(const syscall_context& c, window& win, const std::optional<RECT>& update_rect, bool erase);
@@ -361,15 +362,19 @@ namespace sogen
 
         ui_insets get_host_ui_client_insets(const window& win)
         {
-            const auto border = win.nonclient_border();
-            return {.left = border, .top = border, .right = border, .bottom = border};
+            const auto insets = win.nonclient_insets();
+            return {.left = insets.left, .top = insets.top, .right = insets.right, .bottom = insets.bottom};
         }
 
         void sync_guest_window_rects(window& win)
         {
             const auto window_rect = get_window_rect(win);
-            // Frameless: the client sits at the window origin, so it shares the top-left and shrinks by the frame.
-            const RECT client_rect{.left = win.x, .top = win.y, .right = win.x + win.client_width(), .bottom = win.y + win.client_height()};
+            const RECT client_rect{
+                .left = win.client_x(),
+                .top = win.client_y(),
+                .right = win.client_x() + win.client_width(),
+                .bottom = win.client_y() + win.client_height(),
+            };
 
             win.guest.access([&](USER_WINDOW& guest_win) {
                 guest_win.rcWindow = window_rect;
@@ -444,22 +449,25 @@ namespace sogen
             return position;
         }
 
-        void complete_window_position_change(const syscall_context& c, window& win, const uint64_t window_pos_address,
-                                             emulator_stack_allocation& changed_window_pos_alloc, std::vector<qmsg>& message_queue,
-                                             const bool update_changed_window_position)
+        uint64_t pack_message_lparam(const int low, const int high)
         {
-            EMU_WINDOWPOS position{};
-            c.emu.read_memory(window_pos_address, &position, sizeof(position));
-            if (const auto callback_position = read_window_pos_callback_output(c))
-            {
-                position = *callback_position;
-                c.emu.write_memory(window_pos_address, &position, sizeof(position));
-            }
+            return static_cast<uint64_t>(static_cast<uint16_t>(low)) | (static_cast<uint64_t>(static_cast<uint16_t>(high)) << 16);
+        }
 
+        void apply_window_position_change(const syscall_context& c, window& win, const EMU_WINDOWPOS& position,
+                                          emulator_stack_allocation& changed_window_pos_alloc, std::vector<qmsg>& message_queue,
+                                          const bool update_changed_window_position = true)
+        {
+            const auto old_client_x = win.client_x();
+            const auto old_client_y = win.client_y();
+            const auto old_client_width = win.client_width();
+            const auto old_client_height = win.client_height();
             const auto x = (position.flags & SWP_NOMOVE) != 0 ? win.x : position.x;
             const auto y = (position.flags & SWP_NOMOVE) != 0 ? win.y : position.y;
             const auto width = (position.flags & SWP_NOSIZE) != 0 ? win.width : position.cx;
             const auto height = (position.flags & SWP_NOSIZE) != 0 ? win.height : position.cy;
+
+            // TODO: Handle SWP_FRAMECHANGED once runtime style changes and non-client recalculation are implemented.
             update_window_geometry(c, win, x, y, width, height, false);
 
             EMU_WINDOWPOS changed_position{
@@ -469,13 +477,13 @@ namespace sogen
                 .y = win.y,
                 .cx = win.width,
                 .cy = win.height,
-                .flags = position.flags,
+                .flags = position.flags & ~(SWP_NOCLIENTMOVE | SWP_NOCLIENTSIZE),
             };
-            if ((position.flags & SWP_NOMOVE) != 0)
+            if (old_client_x == win.client_x() && old_client_y == win.client_y())
             {
                 changed_position.flags |= SWP_NOCLIENTMOVE;
             }
-            if ((position.flags & SWP_NOSIZE) != 0)
+            if (old_client_width == win.client_width() && old_client_height == win.client_height())
             {
                 changed_position.flags |= SWP_NOCLIENTSIZE;
             }
@@ -505,15 +513,90 @@ namespace sogen
                     message.lParam = changed_window_pos_alloc.address();
                     break;
                 case WM_MOVE:
-                    message.lParam = static_cast<uint64_t>(((win.y & 0xFFFF) << 16) | (win.x & 0xFFFF));
+                    message.lParam = pack_message_lparam(win.client_x(), win.client_y());
                     break;
                 case WM_SIZE:
-                    message.lParam = static_cast<uint64_t>(((win.client_height() & 0xFFFF) << 16) | (win.client_width() & 0xFFFF));
+                    message.lParam = pack_message_lparam(win.client_width(), win.client_height());
                     break;
                 default:
                     break;
                 }
             }
+        }
+
+        EMU_WINDOWPOS resolve_window_position_callback(const syscall_context& c, const uint64_t window_pos_address)
+        {
+            EMU_WINDOWPOS position{};
+            c.emu.read_memory(window_pos_address, &position, sizeof(position));
+            if (const auto callback_position = read_window_pos_callback_output(c))
+            {
+                position = *callback_position;
+                c.emu.write_memory(window_pos_address, &position, sizeof(position));
+            }
+
+            return position;
+        }
+
+        void release_window_position_allocations(const syscall_context& c, window_position_state& state)
+        {
+            if (state.changed_window_pos_alloc)
+            {
+                c.emu.pop_stack(state.changed_window_pos_alloc);
+            }
+            if (state.window_pos_alloc)
+            {
+                c.emu.pop_stack(state.window_pos_alloc);
+            }
+        }
+
+        void invalidate_window_tree(const syscall_context& c, window& win);
+
+        void apply_set_window_position(const syscall_context& c, window& win, window_position_state& state, const EMU_WINDOWPOS& position)
+        {
+            const auto old_x = win.x;
+            const auto old_y = win.y;
+            const auto old_width = win.width;
+            const auto old_height = win.height;
+
+            apply_window_position_change(c, win, position, state.changed_window_pos_alloc, state.message_queue);
+
+            const bool showing_hidden_window = (position.flags & SWP_SHOWWINDOW) != 0 && (win.style & WS_VISIBLE) == 0;
+            const bool hiding_visible_window = (position.flags & SWP_HIDEWINDOW) != 0 && (win.style & WS_VISIBLE) != 0;
+
+            if ((position.flags & SWP_HIDEWINDOW) != 0)
+            {
+                win.style &= ~WS_VISIBLE;
+                win.guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = win.style; });
+                if (win.host_surface_window)
+                {
+                    c.win_emu.ui().set_window_visible(win.handle, false);
+                }
+            }
+            else if (showing_hidden_window)
+            {
+                win.style |= WS_VISIBLE;
+                win.guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = win.style; });
+                if (win.host_surface_window)
+                {
+                    c.win_emu.ui().set_window_visible(win.handle, true);
+                }
+                invalidate_window_tree(c, win);
+            }
+
+            const bool geometry_changed = old_x != win.x || old_y != win.y || old_width != win.width || old_height != win.height;
+            if ((position.flags & SWP_NOREDRAW) == 0 && !showing_hidden_window && geometry_changed)
+            {
+                invalidate_window(c, win, std::nullopt, false);
+            }
+
+            // TODO: Apply hwndInsertAfter once guest and host z-order mutation are implemented.
+
+            if (geometry_changed || showing_hidden_window || hiding_visible_window)
+            {
+                state.message_queue.push_back(
+                    {.message = WM_WINDOWPOSCHANGED, .wParam = 0, .lParam = state.changed_window_pos_alloc.address()});
+            }
+            state.position_applied = true;
         }
 
         RECT union_update_rect(const RECT& a, const RECT& b)
@@ -1034,6 +1117,11 @@ namespace sogen
         template <typename T>
         void dispatch_next_message(const syscall_context& c, callback_id id, T&& state, const window& win, std::vector<qmsg>& message_queue)
         {
+            if (message_queue.empty())
+            {
+                throw std::runtime_error("Cannot dispatch the next message because the message queue is empty");
+            }
+
             const auto m = message_queue.back();
             message_queue.pop_back();
 
@@ -1055,8 +1143,8 @@ namespace sogen
 
             if (auto* win = c.proc.windows.get(frame.handle))
             {
-                complete_window_position_change(c, *win, frame.pending_window_pos_address, frame.changed_window_pos_alloc,
-                                                frame.message_queue, true);
+                const auto position = resolve_window_position_callback(c, frame.pending_window_pos_address);
+                apply_window_position_change(c, *win, position, frame.changed_window_pos_alloc, frame.message_queue, true);
             }
             frame.pending_window_pos_address = 0;
         }
@@ -1482,11 +1570,6 @@ namespace sogen
             {
                 item.text = read_menu_item_text(c, mi, item_text);
             }
-        }
-
-        uint64_t pack_message_lparam(const int low, const int high)
-        {
-            return static_cast<uint64_t>(static_cast<uint16_t>(low)) | (static_cast<uint64_t>(static_cast<uint16_t>(high)) << 16);
         }
 
     }
@@ -3046,10 +3129,15 @@ namespace sogen
                 guest_win.dwExStyle = ex_style;
                 guest_win.dwStyle = style;
                 guest_win.rcWindow = {.left = x, .top = y, .right = x + width, .bottom = y + height};
-                // The client rect is the window minus its non-client frame (see window::nonclient_border). The
+                // The client rect is the window minus its non-client frame (see window::nonclient_insets). The
                 // guest reads rcClient client-side to size its render target/backbuffer, so seeding it with the
-                // outer rect here makes a framed window render 2px too large and rescale (softening the frame).
-                guest_win.rcClient = {.left = x, .top = y, .right = x + win.client_width(), .bottom = y + win.client_height()};
+                // outer rect here makes a framed window render too large and rescale (softening the frame).
+                guest_win.rcClient = {
+                    .left = win.client_x(),
+                    .top = win.client_y(),
+                    .right = win.client_x() + win.client_width(),
+                    .bottom = win.client_y() + win.client_height(),
+                };
                 if (parent_win && has_child_parent)
                 {
                     guest_win.spwndParent = parent_win->guest.value();
@@ -3075,7 +3163,7 @@ namespace sogen
                     guest_win.spmenu = menu;
                 }
                 guest_win.windowBand = 1; // ZBID_DESKTOP
-                guest_win.dpiContext = USER_DEFAULT_DPI_CONTEXT;
+                guest_win.dpiContext = USER_DEFAULT_WINDOW_DPI_CONTEXT;
                 guest_win.fnid = get_builtin_window_fnid(normalized_class);
                 guest_win.threadId = win.thread_id;
                 guest_win.processId = process_context::process_id;
@@ -3238,7 +3326,7 @@ namespace sogen
             const bool initially_visible = (style & WS_VISIBLE) != 0;
             if (has_child_parent)
             {
-                const auto move_lparam = pack_message_lparam(x, y);
+                const auto move_lparam = pack_message_lparam(win.client_x(), win.client_y());
                 const auto size_lparam = pack_message_lparam(win.client_width(), win.client_height());
                 std::vector<qmsg> child_messages{};
 
@@ -3305,8 +3393,11 @@ namespace sogen
                 const bool activation_position =
                     s.show_data.activation_window_pos_alloc &&
                     s.show_data.pending_window_pos_address == s.show_data.activation_window_pos_alloc.address();
-                complete_window_position_change(c, *win, s.show_data.pending_window_pos_address, s.show_data.changed_window_pos_alloc,
-                                                s.show_data.message_queue, !activation_position);
+
+                const auto position = resolve_window_position_callback(c, s.show_data.pending_window_pos_address);
+                apply_window_position_change(c, *win, position, s.show_data.changed_window_pos_alloc, s.show_data.message_queue,
+                                             !activation_position);
+
                 s.show_data.pending_window_pos_address = 0;
                 show_orchestrator.window_position_completed(activation_position);
             }
@@ -3579,9 +3670,11 @@ namespace sogen
                     data.activation_window_pos_alloc && data.pending_window_pos_address == data.activation_window_pos_alloc.address();
                 if (auto* win = c.proc.windows.get(data.handle))
                 {
-                    complete_window_position_change(c, *win, data.pending_window_pos_address, data.changed_window_pos_alloc,
-                                                    data.message_queue, !activation_position);
+                    const auto position = resolve_window_position_callback(c, data.pending_window_pos_address);
+                    apply_window_position_change(c, *win, position, data.changed_window_pos_alloc, data.message_queue,
+                                                 !activation_position);
                 }
+
                 data.pending_window_pos_address = 0;
                 orchestrator.window_position_completed(activation_position);
             }
@@ -4054,8 +4147,8 @@ namespace sogen
                 display_device.access([&](EMU_DISPLAY_DEVICEW& dev) {
                     dev.StateFlags = 0x5; // DISPLAY_DEVICE_PRIMARY_DEVICE | DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
                     utils::string::copy(dev.DeviceName, u"\\\\.\\DISPLAY1");
-                    utils::string::copy(dev.DeviceString, u"Emulated Virtual Adapter");
-                    utils::string::copy(dev.DeviceID, u"PCI\\VEN_10DE&DEV_0000&SUBSYS_00000000&REV_A1");
+                    utils::string::copy(dev.DeviceString, emulated_display::description);
+                    utils::string::copy(dev.DeviceID, emulated_display::hardware_id);
                     utils::string::copy(dev.DeviceKey, u"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Video\\{00000001-"
                                                        u"0002-0003-0004-000000000005}\\0000");
                 });
@@ -4266,14 +4359,14 @@ namespace sogen
                 return desktop->mapped_object;
             }
 
-            const auto index = handle.value.id;
+            const auto index = static_cast<uint32_t>(handle.value.id);
 
-            if (index == 0 || index >= user_handle_table::MAX_HANDLES)
+            if (index == 0 || index >= user_handle_table::MAX_HANDLE_INDICES)
             {
                 return 0;
             }
 
-            const auto handle_entry = c.proc.user_handles.get_handle_table().read(static_cast<size_t>(index));
+            const auto handle_entry = c.proc.user_handles.get_handle_table().read(user_handle_table::handle_index_to_ahe_slot(index));
             return handle_entry.pHead;
         }
 
@@ -4425,8 +4518,8 @@ namespace sogen
             return old_parent;
         }
 
-        BOOL handle_NtUserSetWindowPos(const syscall_context& c, const hwnd hWnd, const hwnd /*hwnd_insert_after*/, const int x,
-                                       const int y, const int cx, const int cy, const UINT flags)
+        BOOL handle_NtUserSetWindowPos(const syscall_context& c, const hwnd hWnd, const hwnd hwnd_insert_after, const int x, const int y,
+                                       const int cx, const int cy, const UINT flags)
         {
             auto* win = c.proc.windows.get(hWnd);
             if (!win)
@@ -4434,36 +4527,65 @@ namespace sogen
                 return FALSE;
             }
 
-            const auto new_x = (flags & SWP_NOMOVE) ? win->x : x;
-            const auto new_y = (flags & SWP_NOMOVE) ? win->y : y;
-            const auto new_width = (flags & SWP_NOSIZE) ? win->width : cx;
-            const auto new_height = (flags & SWP_NOSIZE) ? win->height : cy;
-            const bool showing_hidden_window = (flags & SWP_SHOWWINDOW) != 0 && (win->style & WS_VISIBLE) == 0;
-            const bool repaint = (flags & SWP_NOREDRAW) == 0 && !showing_hidden_window;
+            EMU_WINDOWPOS position{
+                .hwnd = hWnd,
+                .hwndInsertAfter = hwnd_insert_after,
+                .x = x,
+                .y = y,
+                .cx = cx,
+                .cy = cy,
+                .flags = flags,
+            };
 
-            update_window_geometry(c, *win, new_x, new_y, new_width, new_height, repaint);
+            window_position_state state{};
+            state.window_pos_alloc = c.emu.push_stack(position);
 
-            if ((flags & SWP_HIDEWINDOW) != 0)
+            if ((flags & SWP_NOSENDCHANGING) == 0)
             {
-                win->style &= ~WS_VISIBLE;
-                win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = win->style; });
-                if (win->host_surface_window)
-                {
-                    c.win_emu.ui().set_window_visible(hWnd, false);
-                }
+                const auto window_pos_address = state.window_pos_alloc.address();
+                dispatch_window_message(c, callback_id::NtUserSetWindowPos, std::move(state), *win, WM_WINDOWPOSCHANGING, 0,
+                                        window_pos_address);
             }
-            else if (showing_hidden_window)
+            else
             {
-                win->style |= WS_VISIBLE;
-                win->guest.access([&](USER_WINDOW& guest_win) { guest_win.dwStyle = win->style; });
-                if (win->host_surface_window)
+                apply_set_window_position(c, *win, state, position);
+
+                if (state.message_queue.empty())
                 {
-                    c.win_emu.ui().set_window_visible(hWnd, true);
+                    release_window_position_allocations(c, state);
+                    return TRUE;
                 }
-                // Repaint the now-visible window and its child controls (see invalidate_window_tree).
-                invalidate_window_tree(c, *win);
+
+                dispatch_next_message(c, callback_id::NtUserSetWindowPos, std::move(state), *win, state.message_queue);
             }
 
+            return {};
+        }
+
+        BOOL completion_NtUserSetWindowPos(const syscall_context& c, const hwnd hWnd, const hwnd /*hwnd_insert_after*/, const int /*x*/,
+                                           const int /*y*/, const int /*cx*/, const int /*cy*/, const UINT /*flags*/)
+        {
+            auto& state = c.get_completion_state<window_position_state>();
+            auto* win = c.proc.windows.get(hWnd);
+            if (!win)
+            {
+                release_window_position_allocations(c, state);
+                return FALSE;
+            }
+
+            if (!state.position_applied)
+            {
+                const auto position = resolve_window_position_callback(c, state.window_pos_alloc.address());
+                apply_set_window_position(c, *win, state, position);
+            }
+
+            if (!state.message_queue.empty())
+            {
+                dispatch_next_message(c, callback_id::NtUserSetWindowPos, std::move(state), *win, state.message_queue);
+                return {};
+            }
+
+            release_window_position_allocations(c, state);
             return TRUE;
         }
 
@@ -4635,6 +4757,12 @@ namespace sogen
                         win->wnd_proc = dwNewLong;
                         break;
 
+                    case GWL_STYLE:
+                    case GWL_EXSTYLE:
+                        // TODO: Support runtime GWL_STYLE/GWL_EXSTYLE changes together with
+                        // WM_STYLECHANGING/WM_STYLECHANGED and non-client frame recalculation.
+                        break;
+
                     default:
                         break;
                     }
@@ -4730,6 +4858,18 @@ namespace sogen
             default:
                 return 0;
             }
+        }
+
+        BOOL handle_NtUserIsTopLevelWindow(const syscall_context& c, const hwnd window)
+        {
+            const auto* win = c.proc.windows.get(window);
+            if (!win)
+            {
+                return FALSE;
+            }
+
+            // Owned popups still parent to the desktop; do not consult owner_handle.
+            return win->parent_handle == c.proc.default_desktop_window_handle.bits ? TRUE : FALSE;
         }
 
         BOOL handle_NtUserRedrawWindow(const syscall_context& c, const hwnd hwnd, const emulator_object<RECT> update_rect,
@@ -5085,9 +5225,7 @@ namespace sogen
 
                 adapter_name.access([&](EMU_DISPLAYCONFIG_ADAPTER_NAME& adapterName) {
                     adapterName.header = header;
-                    utils::string::copy(
-                        adapterName.adapterDevicePath,
-                        u"\\\\?\\PCI#VEN_10DE&DEV_1C03&SUBSYS_00000000&REV_A1#4&1234567&0&0008#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}");
+                    utils::string::copy(adapterName.adapterDevicePath, emulated_display::interface_path);
                 });
 
                 return STATUS_SUCCESS;
@@ -5136,17 +5274,15 @@ namespace sogen
 
                     const auto fill_block = [](EMU_DISPLAY_INFO_DEVICE_BLOCK& block) {
                         block.Valid = 1;
-                        block.VendorID = 0x10DE;
-                        block.DeviceID = 0x1C03;
-                        block.SubSystemVendorID = 0x10DE;
+                        block.VendorID = emulated_display::vendor_id;
+                        block.DeviceID = emulated_display::device_id;
+                        block.SubSystemVendorID = emulated_display::vendor_id;
                         block.SubSystemID = 0;
-                        block.RevisionID = 0xA1;
+                        block.RevisionID = emulated_display::revision_id;
                         block.WddmVersion = 3200;
 
-                        utils::string::copy(block.AdapterDesc, u"NVIDIA GeForce GTX 1060 6GB");
-                        utils::string::copy(
-                            block.AdapterDevicePath,
-                            u"\\\\?\\PCI#VEN_10DE&DEV_1C03&SUBSYS_00000000&REV_A1#4&1234567&0&0008#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}");
+                        utils::string::copy(block.AdapterDesc, emulated_display::description);
+                        utils::string::copy(block.AdapterDevicePath, emulated_display::interface_path);
                     };
 
                     fill_block(info.DisplayAdapter);
@@ -5176,14 +5312,14 @@ namespace sogen
                         return;
                     }
 
-                    info.VendorID = 0x10DE;
-                    info.DeviceID = 0x1C03;
+                    info.VendorID = emulated_display::vendor_id;
+                    info.DeviceID = emulated_display::device_id;
                     info.SubSysID0 = 0;
                     info.SubSysID1 = 0;
-                    info.RevisionID = 0xA1;
+                    info.RevisionID = emulated_display::revision_id;
                     info.WddmVersion = 2700;
 
-                    utils::string::copy(info.AdapterDesc, u"NVIDIA GeForce GTX 1060 6GB");
+                    utils::string::copy(info.AdapterDesc, emulated_display::description);
 
                     info.DisplayLeft = 0;
                     info.DisplayTop = 0;
@@ -6012,7 +6148,7 @@ namespace sogen
 
         uint64_t handle_NtUserGetProcessDpiAwarenessContext()
         {
-            return 0;
+            return USER_DEFAULT_DPI_CONTEXT;
         }
 
         NTSTATUS handle_NtUserSetProcessDpiAwarenessContext()
