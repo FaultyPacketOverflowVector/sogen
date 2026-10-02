@@ -66,7 +66,7 @@ jobs:
           arch: x64
 
       - name: CMake Build
-        run: cmake --preset=release && cmake --build --preset=release
+        run: cmake --preset=release -DSOGEN_ENABLE_AVX2=OFF && cmake --build --preset=release
 
       - name: Zip binaries
         shell: pwsh
@@ -82,12 +82,14 @@ jobs:
       - name: Set up Python (wheel)
         uses: actions/setup-python@v7
         with:
-          python-version: "3.9"
+          python-version: "3.14"
 
       - name: Build wheel
         run: |
           python -m pip install --upgrade pip build setuptools-scm
           python -m build "${{ github.workspace }}" --wheel --outdir dist
+        env:
+          CMAKE_ARGS: "-DSOGEN_ENABLE_AVX2=OFF"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7
@@ -126,7 +128,7 @@ jobs:
             libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev
 
       - name: CMake Build
-        run: cmake --preset=release && cmake --build --preset=release
+        run: cmake --preset=release -DSOGEN_ENABLE_AVX2=OFF && cmake --build --preset=release
 
       - name: Tar binaries
         run: tar czf sogen-linux-x64.tar.gz -C build/release/artifacts .
@@ -141,12 +143,14 @@ jobs:
       - name: Set up Python (wheel)
         uses: actions/setup-python@v7
         with:
-          python-version: "3.9"
+          python-version: "3.14"
 
       - name: Build wheel
         run: |
           python -m pip install --upgrade pip build setuptools-scm
           python -m build "${{ github.workspace }}" --wheel --outdir dist
+        env:
+          CMAKE_ARGS: "-DSOGEN_ENABLE_AVX2=OFF"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7
@@ -174,7 +178,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check libclang
 
       - name: CMake Build
-        run: cmake --preset=release && cmake --build --preset=release
+        run: cmake --preset=release -DSOGEN_ENABLE_AVX2=OFF && cmake --build --preset=release
 
       - name: Tar binaries
         run: tar czf sogen-macos-arm64.tar.gz -C build/release/artifacts .
@@ -189,12 +193,14 @@ jobs:
       - name: Set up Python (wheel)
         uses: actions/setup-python@v7
         with:
-          python-version: "3.9"
+          python-version: "3.14"
 
       - name: Build wheel
         run: |
           python -m pip install --upgrade pip build setuptools-scm
           python -m build "${{ github.workspace }}" --wheel --outdir dist
+        env:
+          CMAKE_ARGS: "-DSOGEN_ENABLE_AVX2=OFF"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7
