@@ -1,0 +1,127 @@
+# Simple emulation-root build - produces the guest filesystem for analyzer's -e flag.
+#
+# Copy to .github/workflows/ in your fork, push (or Run workflow), then download
+# the `sogen-emulation-root` artifact. It is a zip containing a single `root/`
+# folder - extract it next to the analyzer binaries:
+#
+#   analyzer -e root c:/test-sample.exe
+#
+# WHAT IT PRODUCES (root/):
+#   root/filesys/c/windows/system32 + syswow64 - ~200 DLLs harvested from the
+#     runner itself (create-root.bat copies System32/SysWOW64: kernel32, ntdll,
+#     combase, d3d11/12, xaudio, .nls, cursors, ...), with DXVK's D3D->Vulkan
+#     DLLs overlaid and vulkan-shim installed as vulkan-1.dll
+#   root/filesys/c/steam                       - steamclient shims (if built)
+#   root/registry/                             - SYSTEM/SOFTWARE/...) hives + NTUSER.DAT
+#     harvested from the runner (grab-registry.bat)
+#   root/apiset dump                            - output of dump-apiset.exe
+#
+# WHAT IT SKIPS vs stock CI: no 2022/2025 matrix (single windows-latest root),
+#   no tests, no tidy, no separate workflow artifacts (tools built inline).
+# NOTE: create-root.bat requires admin - GitHub runners already run elevated.
+
+name: Simple Root Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "src/tools/create-root.bat"
+      - "src/tools/grab-registry.bat"
+      - "src/tools/install-*.ps1"
+      - ".github/workflows/simple-root-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.ref }}-simple-root
+  cancel-in-progress: true
+
+jobs:
+  build-root:
+    name: Build Emulation Root
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # libclang lets the Steam-bridge generator run at configure time, so the
+      # steam shims actually build instead of being silently skipped.
+      - name: Install libclang (Steam bridge codegen)
+        run: python -m pip install --disable-pip-version-check libclang
+
+      - name: Download DirectX Runtime
+        run: curl --connect-timeout 20 --max-time 200 --retry 5 --retry-delay 2 --retry-max-time 200 -L -o directx_Jun2010_redist.exe https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe
+
+      - name: Install DirectX Runtime
+        run: |
+          cmd /c "start /wait directx_Jun2010_redist.exe /Q /T:${{github.workspace}}/dxrt"
+          cmd /c "start /wait .\dxrt\dxsetup.exe /silent"
+
+      - name: Enable Developer Command Prompt (x86)
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x86
+
+      - name: Build 32-bit Root Tools
+        run: cmake --preset=release && cmake --build --preset=release -t emulation-root-tools
+
+      - name: Stash 32-bit Shims
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path shims -Force | Out-Null
+          Copy-Item build/release/artifacts/vulkan-shim.dll shims/vulkan-shim-x86.dll -Force
+          Copy-Item build/release/artifacts/steamclient.dll shims/steamclient.dll -Force
+          Remove-Item build/release -Recurse -Force
+
+      - name: Enable Developer Command Prompt (x64)
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Build 64-bit Root Tools
+        run: cmake --preset=release && cmake --build --preset=release -t emulation-root-tools
+
+      - name: Stage Shims
+        shell: pwsh
+        run: |
+          Move-Item build/release/artifacts/vulkan-shim.dll build/release/artifacts/vulkan-shim-x64.dll -Force
+          Copy-Item shims/vulkan-shim-x86.dll build/release/artifacts/vulkan-shim-x86.dll -Force
+          Copy-Item shims/steamclient.dll build/release/artifacts/steamclient.dll -Force
+
+      - name: Create Emulation Root
+        run: src/tools/create-root.bat
+
+      - name: Dump API Set
+        run: cd root && ../build/release/artifacts/dump-apiset.exe
+
+      - name: Install DXVK and Vulkan Shim
+        shell: pwsh
+        run: ./src/tools/install-gpu-runtime.ps1 -WindowsDir root/filesys/c/windows -Shim64 build/release/artifacts/vulkan-shim-x64.dll -Shim32 build/release/artifacts/vulkan-shim-x86.dll
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Install Steam Shim
+        shell: pwsh
+        run: ./src/tools/install-steam-shim.ps1 -SteamDir root/filesys/c/steam -Shim64 build/release/artifacts/steamclient64.dll -Shim32 build/release/artifacts/steamclient.dll
+
+      - name: Zip root
+        shell: pwsh
+        run: Compress-Archive -Path root -DestinationPath sogen-emulation-root.zip -Force
+
+      - name: Upload root
+        uses: actions/upload-artifact@v7
+        with:
+          name: sogen-emulation-root
+          path: sogen-emulation-root.zip
+          retention-days: 14
